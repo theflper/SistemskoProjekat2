@@ -1,70 +1,55 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
-using ExcelDataReader;
 
 namespace SistemskoProjekat1
 {
     internal class ProcessingTracker
     {
-        //objekat za zakljucavanje koji ce nam pomoci da sinhronizujemo pristup map-i
         private class Entry
         {
-            public bool IsProcessing = true;
+            // TaskCompletionSource nam omogućava da ručno signaliziramo kada je Task gotov
+            public TaskCompletionSource<bool> Tcs { get; } = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         }
+        //Dictionary gde čuvamo šta se trenutno obrađuje
         private readonly Dictionary<string, Entry> map = new Dictionary<string, Entry>();
         private static readonly object globalLock = new object();
-        // Ako neko već obrađuje key onda čekamo da taj neko obradi.
-        // Ako ne nit koja je skontala da niko ne radi obradi zahtev.
-        public bool WaitOrTake(string key)
+        // Metoda je sada ASINHRONA i vraća Task<bool> nije obična funkcija kao u prvom projektu
+        public async Task<bool> WaitOrTakeAsync(string key)
         {
             Entry entry;
+            bool isWorker = false;
             lock (globalLock)
             {
                 if (!map.TryGetValue(key, out entry))
                 {
-                    // nema ga da se trenutno obradjuje onda ga mi obrađujemo
                     entry = new Entry();
                     map[key] = entry;
-                    return true; // ja sam worker
+                    isWorker = true;
                 }
             }
-            //ako već postoji, čekaj NA TOM entry-ju
-            //ovim blokiramo niti dok neka druga nit ne obradi fajl
-            //to definise ovaj isProcessing
-            lock (entry)
+            if (isWorker)
             {
-                while (entry.IsProcessing)
-                {
-                    Monitor.Wait(entry);
-                }
+                return true;
             }
-            //neko drugi zavrsio mi cemo samo iz kesa da procitamo
-            return false;
+            // ako neko već obrađuje nema blokiranja niti 
+            // nit se oslobađa, a runtime čeka da Tcs dobije rezultat.
+            await entry.Tcs.Task;
+            return false; // Neko drugi je završio obradu, ja samo čitam iz keša
         }
         // Signalizira da je obrada gotova
         public void Done(string key)
         {
             Entry entry;
-            //provera da ne dodje do greske za svaki slucaj
             lock (globalLock)
             {
-                //nanbavi iz dictionary
-                //ako ga vec nema nista
                 if (!map.TryGetValue(key, out entry))
                     return;
-                map.Remove(key);//ako je u dictionary ukloni key
+                map.Remove(key);
             }
-            lock (entry)
-            {
-                //promeni isProcessing da ne cekaju ostali u while
-                entry.IsProcessing = false;
-                //probudi niti da prodju kroz 
-                Monitor.PulseAll(entry);
-            }
+            // signaliziramo svim nitima koje su uradile 'await entry.Tcs.Task' 
+            // da je posao gotov sve one se sada bude asinhrono.
+            entry.Tcs.TrySetResult(true);
         }
     }
 }

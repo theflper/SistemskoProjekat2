@@ -1,14 +1,15 @@
-﻿using System;
+﻿using ExcelDataReader;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using ExcelDataReader;
 
 namespace SistemskoProjekat1
 {
@@ -19,6 +20,8 @@ namespace SistemskoProjekat1
             public HttpListenerContext Context { get; set; }//kontekst zahteva, sadrzi sve informacije o zahtevu i odgovoru
             public string FileName { get; set; }//ime fajla koji je trazen u zahtevu
         }
+        // Dodaj na nivo klase (pored cache-a) jedan običan lock objekat
+        private static readonly object cacheLock = new object();
         //keš za cuvanje sadrzaja fajlova koji su vec ucitani, da se ne bi svaki put ucitavali sa diska
         //string je ime fajla, a byte[] je sadrzaj fajla
         private LRUCache cache = new LRUCache(40);//novi LRU cache velicine 40
@@ -81,7 +84,7 @@ namespace SistemskoProjekat1
                     // uzmi samo ime fajla (odbaci sve putanje)
                     file = Path.GetFileName(file);
                     var req = new Request { Context = context, FileName = file };
-                    ThreadPool.QueueUserWorkItem(_ => ProcessRequest(req));
+                    Task.Run(async() => await ProcessRequest(req));
                 }
                 catch (HttpListenerException ex)
                 {
@@ -110,7 +113,7 @@ namespace SistemskoProjekat1
         {
             isRunning = false;
         }
-        private void ProcessRequest(Request req)
+        private async Task ProcessRequest(Request req)
         {
             try
             {
@@ -118,48 +121,37 @@ namespace SistemskoProjekat1
                     return;
                 if (string.IsNullOrEmpty(req.FileName))
                 {
-                    SendText(req, "Missing file", 400);
+                    await SendText(req, "Missing file", 400);
                     return;
                 }
                 if (!req.FileName.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
                 {
-                    SendText(req, "Only .csv files are allowed", 400);
+                    await SendText(req, "Only .csv files are allowed", 400);
                     return;
                 }
-                //kad smo izvukli zahtev iz reda sad mozemo da oslobodimo lock na redu
-                //i da obradjujemo zahtev bez blokiranja drugih radnih niti koje mogu da prihvate nove zahteve
-                semaphore.Wait();
-                //iako nemamo catch ovo sve garantuje da se semafor oslobodi
-                //i da ne ostane zauzet ako dodje do greske u obradi zahteva
-                try
-                {
-                    HandleRequest(req);//obrada zahteva
-                }
-                finally
-                {
-                    semaphore.Release();//oslobadjamo semafor nakon obrade zahteva
-                    // da bi druge radne niti mogle da obradjuju nove zahteve
-                }
+                // Koristimo WaitAsync() umesto sinhronog Wait()
+                // Ako je server pun, ova nit se oslobađa dok se ne oslobodi mesto u semaforu!
+                await HandleRequestAsync(req);//obrada zahteva
             }
             catch (Exception ex)
             {
-                SendText(req, "Error: " + ex.Message, 500);
+                await SendText(req, "Error: " + ex.Message, 500);
             }
         }
-        private void HandleRequest(Request req)
+        private async Task HandleRequestAsync(Request req)
         {
             try
             {
                 if (string.IsNullOrEmpty(req.FileName))
                 {
-                    SendText(req, "Missing file parameter", 400);
+                    await SendText(req, "Missing file parameter", 400);
                     return;
                 }
-                byte[] excelData = GetFromCacheOrProcess(req);
+                byte[] excelData = await GetFromCacheOrProcessAsync(req);
                 if (excelData == null)
                 {
                     if (req.Context.Response.StatusCode == 500) return;
-                    SendText(req, "File not found", 404);
+                    await SendText(req, "File not found", 404);
                     return;
                 }
                 //podesi tip odgovora na Excel format i posalji podatke nazad klijentu
@@ -173,8 +165,10 @@ namespace SistemskoProjekat1
                 //umesto attachment koristi reč inline.
                 //podesi duzinu odgovora da bi klijent znao koliko podataka ce dobiti
                 req.Context.Response.ContentLength64 = excelData.Length;
-                //u body odgovora upisujemo sadrzaj excel fajla koji smo dobili iz cache-a ili obradom csv fajla
-                req.Context.Response.OutputStream.Write(excelData, 0, excelData.Length);
+                // u body odgovora upisujemo sadrzaj excel fajla koji smo dobili iz cache-a ili obradom csv fajla
+                // optimizacija u odnosu na sinhrono jer je asinhrono slanje podataka. 
+                // dok se fajl šalje kroz mrežu spovom klijentu, nit se oslobađa i može da usluži nekog drugog!
+                await req.Context.Response.OutputStream.WriteAsync(excelData, 0, excelData.Length);
                 req.Context.Response.OutputStream.Close();
                 //podesili smo sta treba da se posalje klijentu, sad zatvaramo output stream da bi se odgovor poslao
                 req.Context.Response.Close();
@@ -182,7 +176,7 @@ namespace SistemskoProjekat1
             }
             catch (Exception e)
             {
-                SendText(req, "Error: " + e.Message);
+                await SendText(req, "Error: " + e.Message);
                 //ako je doslo do greske u obradi zahteva, posaljemo klijentu poruku o gresci
             }
             finally
@@ -192,48 +186,62 @@ namespace SistemskoProjekat1
                 //ali ako klijent vise nije tu, onda ce se desiti greska prilikom zatvaranja veze, pa zato imamo try-catch
             }
         }
-        private byte[] GetFromCacheOrProcess(Request req)
+        private async Task<byte[]> GetFromCacheOrProcessAsync(Request req)
         {
             string fileName = req.FileName;
             try
             {
-                // probaj da ga pribavis iz kesa
-                var cached = cache.Get(fileName);
-                //ako ne vrati null cache hit
-                if (cached != null)
-                    return cached;
-                //pokušaj da obradis fajl ako se vec ne obradjuje
-                bool iAmWorker = tracker.WaitOrTake(fileName);
+                //brza provera keša
+                lock (cacheLock)
+                {
+                    var cached = cache.Get(fileName);
+                    if (cached != null) return cached;
+                }
+                // ako nije u kešu, tek tada se borimo oko tracker-a
+                bool iAmWorker = await tracker.WaitOrTakeAsync(fileName);
                 if (!iAmWorker)
                 {
-                    // neko drugi je obradio i sad fajl mora biti u cache-u
-                    return cache.Get(fileName);
+                    //ekskluzivno pristupamo kešu jer svi krenu odjednom kad je gotovo
+                    lock (cacheLock)
+                    {
+                        var postProcessedCached = cache.Get(fileName);
+                        if (postProcessedCached != null) return postProcessedCached;
+                    }
+                    throw new Exception("Obrada fajla od strane druge niti nije uspela.");
                 }
+                // (jedna jedina nit za taj fajl) prolazi kroz semafor
+                // Ovo štiti tvoj procesor i disk ako stigne 50 različitih fajlova odjednom
+                await semaphore.WaitAsync();
                 byte[] result = null;
                 try
                 {
-                    //losa putanja vrati null
-                    if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
-                        return null;
-                    //ako ne izdvoji samo ime fajla i spoji sa data folderom koji je u bin debug projekta
+                    if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
+
                     string path = Path.Combine("data", Path.GetFileName(fileName));
-                    //ako putanja ne postoji vrati null
-                    if (!File.Exists(path))
-                        return null;
-                    //samo nit koja obradjuje dodje do ovde
+                    if (!File.Exists(path)) return null;
+
                     result = ConvertCsvToExcel(path);
                 }
                 finally
                 {
+                    // Prvo punimo keš
                     if (result != null)
-                        cache.Put(fileName, result);
+                    {
+                        lock (cacheLock)
+                        {
+                            cache.Put(fileName, result);
+                        }
+                    }
+                    // Oslobađamo semafor za druge fajlove
+                    semaphore.Release();
+                    // Budimo ostale niti koje su čekale na ovaj konkretan fajl
                     tracker.Done(fileName);
                 }
                 return result;
             }
             catch (Exception e)
             {
-                SendText(req, "Error: " + e.Message, 500);
+                await SendText(req, "Error: " + e.Message, 500);
                 return null;
             }
         }
@@ -261,7 +269,7 @@ namespace SistemskoProjekat1
                 return ms.ToArray();
             }
         }
-        private void SendText(Request req, string text, int statusCode = 200)
+        private async Task SendText(Request req, string text, int statusCode = 200)
         {
             try
             {
@@ -273,7 +281,7 @@ namespace SistemskoProjekat1
                 byte[] data = System.Text.Encoding.UTF8.GetBytes(text);
                 //podesi duzinu odgovora da bi klijent znao koliko podataka ce dobiti
                 req.Context.Response.ContentLength64 = data.Length;
-                req.Context.Response.OutputStream.Write(data, 0, data.Length);
+                await req.Context.Response.OutputStream.WriteAsync(data, 0, data.Length);
             }
             catch
             {

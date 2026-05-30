@@ -30,6 +30,7 @@ namespace SistemskoProjekat1
             this.capacity = capacity;
             map = new Dictionary<string, LinkedListNode<(string, byte[])>>();
             lruList = new LinkedList<(string, byte[])>();
+            ttlList = new LinkedList<(string, DateTime)>();
             Thread t= new Thread(() => cleanup());
             t.IsBackground = true;
             t.Start();
@@ -79,9 +80,6 @@ namespace SistemskoProjekat1
         }
         public byte[] Get(string key)
         {
-            //provera da ne dodje do greske za svaki slucaj
-            if (lockObj == null)
-                lockObj = new object();
             lock (lockObj)
             {
                 if (!map.TryGetValue(key, out var node))
@@ -94,9 +92,6 @@ namespace SistemskoProjekat1
         }
         public void Put(string key, byte[] value)
         {
-            //provera da ne dodje do greske za svaki slucaj
-            if (lockObj == null)
-                lockObj = new object();
             lock (lockObj)
             {
                 if (map.TryGetValue(key, out var existing))
