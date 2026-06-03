@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
-namespace SistemskoProjekat1
+namespace SistemskoProjekat2
 {
     internal class ProcessingTracker
     {

@@ -11,7 +11,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace SistemskoProjekat1
+namespace SistemskoProjekat2
 {
     internal class Server
     {
@@ -25,93 +25,104 @@ namespace SistemskoProjekat1
         //keš za cuvanje sadrzaja fajlova koji su vec ucitani, da se ne bi svaki put ucitavali sa diska
         //string je ime fajla, a byte[] je sadrzaj fajla
         private LRUCache cache = new LRUCache(40);//novi LRU cache velicine 40
-        private bool isRunning = false;
         //semafor za ogranicavanje broja istovremenih obrada zahteva, da se ne bi preopteretio server
         private SemaphoreSlim semaphore = new SemaphoreSlim(10);
         //dozvoljava samo 3 radne niti da istovremeno obradjuju zahteve, ostale ce cekati dok se semafor ne oslobodi
         private ProcessingTracker tracker = new ProcessingTracker();
         //tracker prati sta se trenutno obradjuje
-        public void Start()
+        public void Start(CancellationToken token)
         {
             HttpListener listener = new HttpListener();
             listener.Prefixes.Add("http://localhost:5050/");
             try
             {
                 listener.Start();
-                isRunning = true;
-                Console.WriteLine("Server uspešno pokrenut na portu 5050...");
+                Logger.Log("Server uspešno pokrenut na portu 5050...");
             }
             catch (HttpListenerException ex)
             {
                 // Specifične greške sistema (Port zauzet ili Access Denied)
                 if (ex.ErrorCode == 5) // Access Denied
                 {
-                    Console.WriteLine("Greška: Pokreni VS/Terminal kao administrator.");
+                    Logger.Log("Greška: Pokreni VS/Terminal kao administrator.");
                 }
                 else
                 {
-                    Console.WriteLine($"Sistemska greška pri pokretanju: {ex.Message}");
+                    Logger.Log($"Sistemska greška pri pokretanju: {ex.Message}");
                 }
             }
             catch (Exception ex)              // Sve ostale nepredviđene greške
             {
-                Console.WriteLine($"Neočekivana greška: {ex.Message}");
+                Logger.Log($"Neočekivana greška: {ex.Message}");
             }
             finally
             {
                 // Ako server NIJE uspeo da se pokrene, ovde proveravamo da li treba ugasiti listener
                 if (!listener.IsListening)
                 {
-                    Console.WriteLine("Server nije pokrenut. Proverite konfiguraciju.");
+                    Logger.Log("Server nije pokrenut. Proverite konfiguraciju.");
                     listener.Close();
                 }
             }
-            // worker niti obradjuju zahteve iz reda, a glavna nit prihvata nove zahteve i stavlja ih u red
-            ThreadPool.GetMaxThreads(out int maxWorkerThreads, out int maxCompletionPortThreads);
-            //broj radnih niti koje ThreadPool moze da koristi i broj niti koje moze da koristi za IO operacije
-            //10ak niti stavi
-            int poolSize = Math.Min(10, maxWorkerThreads);
-            // prihvatanje zahteva dok listener radi, i dodavanje zahteva u red da ih radne niti obrade
-            while (listener.IsListening && isRunning)
+            // Kada se okine spoljašnje gašenje preko tokena, gasimo listener da prekine GetContext()
+            token.Register(() =>
+            {
+                try { 
+                    listener.Stop();//prekini da slusas
+                    listener.Close();//oslobodi port 5050 koji server koristi
+                } catch { }
+            });
+            //dodata je provera da li je token otkazan u while petlji da stanemo sa radom
+            while (listener.IsListening && !token.IsCancellationRequested)
             {
                 try
                 {
-                    //listener.GetContext() blokira glavnu nit dok ne stigne novi zahtev, i onda vraca kontekst zahteva
+                    // listener.GetContext() blokira glavnu nit dok ne stigne novi zahtev, i onda vraca kontekst zahteva
                     // Koristimo await - nit se oslobađa dok klijent ne pošalje zahtev
+                    // Kada se listener.Stop() pozove unutar token.Register, 
+                    // GetContext() će baciti HttpListenerException i tako prekinuti blokadu!
                     var context = listener.GetContext();
                     //kada stigne zahtev, izvucemo ime fajla iz URL-a zahteva
                     string file = context.Request.Url.AbsolutePath;
                     // uzmi samo ime fajla (odbaci sve putanje)
                     file = Path.GetFileName(file);
                     var req = new Request { Context = context, FileName = file };
-                    Task.Run(async() => await ProcessRequest(req));
+                    var processingTask = Task.Run(async () => await ProcessRequest(req));
+                    processingTask.ContinueWith(t =>
+                    {
+                        if (t.IsFaulted)
+                        {
+                            Logger.Log($"ERROR: Zahtev za fajl '{req.FileName}' je pretrpeo kritičnu grešku: {t.Exception.GetBaseException().Message}");
+                        }
+                        else
+                        {
+                            Logger.Log($"INFO: Zahtev za fajl '{req.FileName}' je uspešno procesuiran.");
+                        }
+                    }, TaskContinuationOptions.ExecuteSynchronously);
                 }
                 catch (HttpListenerException ex)
                 {
                     // Dešava se ako se listener ugasi ili port postane nedostupan
-                    if (!listener.IsListening) break;
-                    Console.WriteLine($"Mrežna greška: {ex.Message}");
+                    if (!listener.IsListening || token.IsCancellationRequested) break;
+                    Logger.Log($"Mrežna greška: {ex.Message}");
                 }
                 catch (ObjectDisposedException)
                 {
-                    Console.WriteLine("Listener je zatvoren iz drugog thread-a.");
+                    Logger.Log("Listener je zatvoren iz drugog thread-a.");
                     break;
                 }
                 catch (Exception ex)
                 {
+                    // Ako nas sistem gasi, ignoriši greške pri prekinutom prihvatanju novih veza
+                    if (token.IsCancellationRequested) break;
                     // Za sve ostale nepredviđene greške
-                    Console.WriteLine($"Greška prilikom obrade: {ex.Message}");
+                    Logger.Log($"Greška prilikom obrade: {ex.Message}");
                 }
             }
             if (!listener.IsListening)
             {
-                Stop();//ako listener nije više aktivan, zaustavi server i oslobodi resurse
-                Console.WriteLine("Server je zaustavljen.");
+                Logger.Log("Server je zaustavljen.");
             }
-        }
-        public void Stop()//pri gasenju servera postavljamo isRunning na false da bi prestali sa while petljom koja osluskuje
-        {
-            isRunning = false;
         }
         private async Task ProcessRequest(Request req)
         {
@@ -173,6 +184,7 @@ namespace SistemskoProjekat1
                 //podesili smo sta treba da se posalje klijentu, sad zatvaramo output stream da bi se odgovor poslao
                 req.Context.Response.Close();
                 //zatvaramo celu HTTP vezu da oslobodimo resurse i da bi klijent znao da je odgovor kompletan
+                Logger.Log("Zahtev za fajl '" + req.FileName + "' je uspešno obrađen i poslat klijentu.");
             }
             catch (Exception e)
             {
@@ -216,11 +228,19 @@ namespace SistemskoProjekat1
                 try
                 {
                     if (fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
-
                     string path = Path.Combine("data", Path.GetFileName(fileName));
                     if (!File.Exists(path)) return null;
-
-                    result = ConvertCsvToExcel(path);
+                    // Pokrećemo tvoju sinhronu metodu u pozadinskom Tasku
+                    // conversionTask postaje tipa Task<byte[]> iako je metoda obična sinhrona
+                    var conversionTask = Task.Run(() => ConvertCsvToExcel(path));
+                    //Pošto je to sada Task, na njega MOŽEMO zakačiti ContinueWith osigurač
+                    _=conversionTask.ContinueWith(t =>
+                    {
+                        Logger.Log($"CRITICAL: Konverzija za {fileName} je fatalno otkazala! Automatski čistim tracker.");
+                        tracker.Done(fileName);
+                    }, TaskContinuationOptions.OnlyOnFaulted);
+                    //Pošto smo unutar async metode, radimo await nad tim taskom da dobijemo byte[]
+                    result = await conversionTask;
                 }
                 finally
                 {
