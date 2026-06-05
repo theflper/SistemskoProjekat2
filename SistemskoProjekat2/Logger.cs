@@ -35,23 +35,38 @@ namespace SistemskoProjekat2
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
-Koristio sam static klasu jer naš loger nema potrebu za stanjem objekta,
+static klasu jer naš loger nema potrebu za stanjem objekta,
 ne treba da implementira nikakve interfejse (poput ILogger),
 niti nam je potrebno fleksibilno upravljanje njegovim životnim vekom.
 static klasa u .NET-u nam garantuje da će se statički konstruktor izvršiti bezbedno
-za niti (thread-safe) pri prvom pristupu i obezbeđuje globalno dostu
+za niti (thread-safe) pri prvom pristupu i obezbeđuje globalno dostupnost
 */
 /*
- "Razmišljao sam o korišćenju eksplicitne Thread klase,
-ali sam se odlučio za Task sa opcijom TaskCreationOptions.LongRunning. .NET Framework u 
+ umesto eksplicitno Thread klase, Task sa opcijom TaskCreationOptions.LongRunning. .NET Framework u 
 tom slučaju prepoznaje da se radi o dugovečnom poslu i eksplicitno kreira novu namensku nit van ThreadPool-a,
 čime postižemo isti efekat, ali zadržavamo prednosti moderne TPL apstrakcije i lakše
-upravljanje životnim vekom zadatka."
+upravljanje životnim vekom zadatka.
 
-"Što se tiče zaključavanja, ručni lock nije potreban jer BlockingCollection<string>
+Što se tiče zaključavanja, ručni lock nije potreban jer BlockingCollection<string>
 unutar sebe već implementira thread-safe mehanizme i optimizovanu signalizaciju.
 Ona uspešno rešava konkurentnost između više proizvođača (radnih niti) 
 i jednog potrošača (loger niti), pritom automatski uspavljujući potrošača kada je red prazan,
-što oslobađa procesorske resurse."
+što oslobađa procesorske resurse.
  */
