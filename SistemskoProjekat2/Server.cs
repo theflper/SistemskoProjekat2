@@ -87,7 +87,7 @@ namespace SistemskoProjekat2
                     // uzmi samo ime fajla (odbaci sve putanje)
                     file = Path.GetFileName(file);
                     var req = new Request { Context = context, FileName = file };
-                    var processingTask = Task.Run(async () => await ProcessRequest(req));
+                    var processingTask = ProcessRequest(req);//izvrsi task pa nastavi posle
                     processingTask.ContinueWith(t =>
                     {
                         if (t.IsFaulted)
@@ -265,6 +265,7 @@ namespace SistemskoProjekat2
                 return null;
             }
         }
+        //ovo je sinhron pristup moglo je asinhrono nauci tradeoff
         private byte[] ConvertCsvToExcel(string path)
         {
             //jednostavna simulacija konverzije ne pravimo txt fajl vec TSV fajl koji browser cita kao .xlsx
