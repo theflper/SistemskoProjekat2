@@ -42,7 +42,7 @@ namespace SistemskoProjekat2
                 DateTime end=DateTime.MinValue;
                 string key = null;
                 bool hasElement = false;
-                //Uzimamo podatke sa TTL liste pod JEDNIM lock-om
+                //Uzimamo podatke sa TTL liste pod ttlObj lock-om
                 lock (ttlObj)
                 {
                     if (ttlList.Count > 0)
